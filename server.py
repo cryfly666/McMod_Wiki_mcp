@@ -46,6 +46,12 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
         try:
             async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
                 resp = await client.get(url)
+
+                # 检查是否被重定向到404页面
+                final_url = str(resp.url)
+                if "/404" in final_url or "/error" in final_url:
+                    return None
+
                 resp.raise_for_status()
                 html = resp.text
 
@@ -62,6 +68,9 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
 
                 _cache[url] = (time.time(), html)
                 return BeautifulSoup(html, "html.parser")
+        except httpx.HTTPStatusError:
+            # 4xx/5xx 错误直接返回 None
+            return None
         except Exception:
             if attempt < retries:
                 await asyncio.sleep(0.5 * (attempt + 1))
@@ -86,6 +95,9 @@ async def mcmod_search(keyword: str, search_type: str = "all", limit: int = 10) 
         search_type: 搜索类型 - all(全部), mod(模组), modpack(整合包), item(物品), post(教程)
         limit: 返回结果数量，默认 10
     """
+    if not keyword or not keyword.strip():
+        return "❌ 请输入搜索关键词"
+
     # filter: 1=模组, 2=整合包, 3=物品, 4=教程
     type_map = {"all": "", "mod": "&filter=1", "modpack": "&filter=2", "item": "&filter=3", "post": "&filter=4"}
     filter_param = type_map.get(search_type, "")
@@ -93,7 +105,7 @@ async def mcmod_search(keyword: str, search_type: str = "all", limit: int = 10) 
 
     soup = await fetch_page(url, use_cache=False)
     if not soup:
-        return "搜索失败，请检查网络连接后重试"
+        return "❌ 搜索失败，MC百科服务器可能暂时不可用，请稍后重试"
 
     results = []
     seen = set()
@@ -124,6 +136,13 @@ async def mcmod_search(keyword: str, search_type: str = "all", limit: int = 10) 
             elif "/item/" in href and "/item/list/" not in href:
                 item_id = extract_id_from_url(href, r"/item/(\d+)")
                 item_type = "物品"
+                # 物品搜索结果格式: "物品名 (英文名) - 模组名" 或 "物品名 - 模组名"
+                # 提取模组名 (使用正则匹配最后一个 " - " 或 "- ")
+                mod_match = re.search(r"(.+?)\s*[-–]\s*(\[[^\]]+\].+|[^-]+)$", title)
+                if mod_match:
+                    item_name = mod_match.group(1).strip()
+                    mod_name = mod_match.group(2).strip()
+                    title = f"{item_name} | 来自: {mod_name}"
             elif "/post/" in href:
                 item_id = extract_id_from_url(href, r"/post/(\d+)")
                 item_type = "教程"
@@ -143,10 +162,12 @@ async def mcmod_search(keyword: str, search_type: str = "all", limit: int = 10) 
         # 检查是否有"未找到"提示
         no_result = soup.select_one(".search-result")
         if no_result and "没有找到" in no_result.get_text():
-            return f"MC百科未收录与 '{keyword}' 相关的内容"
-        return f"未找到与 '{keyword}' 相关的结果"
+            return f"🔍 MC百科未收录与 '{keyword}' 相关的内容，可以尝试其他关键词"
+        return f"🔍 未找到与 '{keyword}' 相关的结果，建议检查拼写或使用英文名搜索"
 
-    return f"搜索 '{keyword}' 的结果 ({len(results)}条):\n\n" + "\n".join(results)
+    type_names = {"all": "全部", "mod": "模组", "modpack": "整合包", "item": "物品", "post": "教程"}
+    type_hint = type_names.get(search_type, "全部")
+    return f"🔍 搜索 '{keyword}' ({type_hint}) 的结果 ({len(results)}条):\n\n" + "\n".join(results)
 
 
 @mcp.tool()
@@ -155,14 +176,22 @@ async def mcmod_get_mod(mod_id: int) -> str:
     获取模组详情
 
     Args:
-        mod_id: 模组 ID，如 2021 (机械动力)、6 (应用能源2)
+        mod_id: 模组 ID，如 2021 (机械动力)、260 (应用能源2)
     """
+    if mod_id <= 0:
+        return "❌ 无效的模组 ID，ID 必须是正整数"
+
     url = f"{BASE_URL}/class/{mod_id}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取模组 {mod_id} 失败，请检查 ID 是否正确"
+        return f"❌ 获取模组失败，ID {mod_id} 可能不存在或网络异常"
 
-    result = [f"模组 ID: {mod_id}"]
+    # 检查是否为 404 页面
+    title = soup.select_one("title")
+    if title and "404" in title.get_text():
+        return f"❌ 模组 ID {mod_id} 不存在，请检查 ID 是否正确"
+
+    result = [f"📦 模组 ID: {mod_id}"]
 
     # 提取名称
     name_cn = soup.select_one("h3")
@@ -185,11 +214,22 @@ async def mcmod_get_mod(mod_id: int) -> str:
             if match:
                 result.append(f"{field}: {match.group(1).strip()}")
 
+    # 提取支持的 MC 版本 (从 modlist 链接中提取)
+    version_links = soup.select("a[href*='mcver=']")
+    if version_links:
+        versions = []
+        for link in version_links[:12]:
+            ver = link.get_text(strip=True)
+            if ver and re.match(r"^\d+\.\d+", ver):
+                versions.append(ver)
+        if versions:
+            result.append(f"MC版本: {', '.join(versions)}")
+
     # 提取简介
     intro = soup.select_one(".text-area.common-text")
     if intro:
         intro_text = intro.get_text(" ", strip=True)[:600]
-        result.append(f"\n简介:\n{intro_text}...")
+        result.append(f"\n📝 简介:\n{intro_text}...")
 
     # 提取资料统计
     type_links = soup.select("a[href*='/item/list/']")
@@ -200,9 +240,23 @@ async def mcmod_get_mod(mod_id: int) -> str:
             if text and "(" in text:
                 stats.append(text)
         if stats:
-            result.append(f"\n资料统计: {', '.join(stats)}")
+            result.append(f"\n📊 资料统计: {', '.join(stats)}")
 
-    result.append(f"\n页面链接: {url}")
+    # 相关链接
+    ext_links = []
+    for link in soup.select("a[data-original-title]"):
+        tooltip = link.get("data-original-title", "")
+        href = link.get("href", "")
+        if "CurseForge" in tooltip:
+            ext_links.append(f"CurseForge: {tooltip.replace('CurseForge: ', '')}")
+        elif "Modrinth" in tooltip:
+            ext_links.append(f"Modrinth: {tooltip.replace('Modrinth: ', '')}")
+        elif "GitHub" in tooltip and "Wiki" not in tooltip:
+            ext_links.append(f"GitHub: {tooltip.replace('GitHub: ', '')}")
+    if ext_links:
+        result.append(f"\n🔗 外部链接:\n" + "\n".join(ext_links[:4]))
+
+    result.append(f"\n🌐 页面链接: {url}")
     return "\n".join(result)
 
 
@@ -216,10 +270,17 @@ async def mcmod_list_items(mod_id: int, item_type: int = 1, limit: int = 30) -> 
         item_type: 类型 - 1(物品/方块), 4(生物), 5(附魔), 7(多方块), 9(热键), 10(游戏设定)
         limit: 返回数量，默认 30
     """
+    if mod_id <= 0:
+        return "❌ 无效的模组 ID"
+
+    type_names = {1: "物品/方块", 4: "生物", 5: "附魔", 7: "多方块", 9: "热键", 10: "游戏设定"}
+    if item_type not in type_names:
+        return f"❌ 无效的类型，支持的类型: {', '.join(f'{k}({v})' for k, v in type_names.items())}"
+
     url = f"{BASE_URL}/item/list/{mod_id}-{item_type}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取物品列表失败，请检查模组 ID {mod_id} 是否正确"
+        return f"❌ 获取物品列表失败，模组 ID {mod_id} 可能不存在"
 
     items = []
     seen = set()
@@ -244,11 +305,11 @@ async def mcmod_list_items(mod_id: int, item_type: int = 1, limit: int = 30) -> 
             items.append(display)
 
     if not items:
-        return f"模组 {mod_id} 暂无该类型 (type={item_type}) 的物品数据"
+        type_name = type_names.get(item_type, "物品")
+        return f"📭 模组 {mod_id} 暂无{type_name}数据，可能该模组未收录此类资料"
 
-    type_names = {1: "物品/方块", 4: "生物", 5: "附魔", 7: "多方块", 9: "热键", 10: "游戏设定"}
     type_name = type_names.get(item_type, "物品")
-    header = f"模组 {mod_id} 的{type_name}列表 (共{len(items)}项"
+    header = f"📋 模组 {mod_id} 的{type_name}列表 (共{len(items)}项"
     if len(items) > limit:
         header += f"，显示前{limit}项"
     header += "):\n\n"
@@ -263,12 +324,20 @@ async def mcmod_get_item(item_id: int) -> str:
     Args:
         item_id: 物品 ID，如 196531 (水车)、196521 (传动杆)
     """
+    if item_id <= 0:
+        return "❌ 无效的物品 ID"
+
     url = f"{BASE_URL}/item/{item_id}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取物品 {item_id} 失败，请检查 ID 是否正确"
+        return f"❌ 获取物品失败，ID {item_id} 可能不存在或网络异常"
 
-    result = [f"物品 ID: {item_id}"]
+    # 检查是否为 404 页面
+    title = soup.select_one("title")
+    if title and "404" in title.get_text():
+        return f"❌ 物品 ID {item_id} 不存在，请检查 ID 是否正确"
+
+    result = [f"🧱 物品 ID: {item_id}"]
 
     # 物品名称
     name = soup.select_one("span.name, h5")
@@ -294,16 +363,16 @@ async def mcmod_get_item(item_id: int) -> str:
                 recipe_text = recipe_text.replace("标签: ", "").replace("minecraft:", "")
                 recipe_list.append(f"  • {recipe_text}")
         if recipe_list:
-            result.append(f"\n合成配方:")
+            result.append(f"\n🔧 合成配方:")
             result.extend(recipe_list)
 
     # 物品介绍
     intro = soup.select_one(".item-content.common-text")
     if intro:
         intro_text = intro.get_text(" ", strip=True)[:1000]
-        result.append(f"\n介绍:\n{intro_text}")
+        result.append(f"\n📝 介绍:\n{intro_text}")
 
-    result.append(f"\n页面链接: {url}")
+    result.append(f"\n🌐 页面链接: {url}")
     return "\n".join(result)
 
 
@@ -316,10 +385,13 @@ async def mcmod_list_tutorials(mod_id: int, limit: int = 15) -> str:
         mod_id: 模组 ID
         limit: 返回数量，默认 15
     """
+    if mod_id <= 0:
+        return "❌ 无效的模组 ID"
+
     url = f"{BASE_URL}/class/{mod_id}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取教程列表失败，请检查模组 ID {mod_id} 是否正确"
+        return f"❌ 获取教程列表失败，模组 ID {mod_id} 可能不存在"
 
     tutorials = []
     seen = set()
@@ -340,9 +412,9 @@ async def mcmod_list_tutorials(mod_id: int, limit: int = 15) -> str:
             tutorials.append(f"- {title} [ID: {post_id}]\n  {full_href}")
 
     if not tutorials:
-        return f"模组 {mod_id} 暂无教程"
+        return f"📭 模组 {mod_id} 暂无教程，可以尝试搜索相关视频教程"
 
-    header = f"模组 {mod_id} 的教程列表 (共{len(tutorials)}篇):\n\n"
+    header = f"📚 模组 {mod_id} 的教程列表 (共{len(tutorials)}篇):\n\n"
     return header + "\n\n".join(tutorials[:limit])
 
 
@@ -354,12 +426,20 @@ async def mcmod_get_tutorial(post_id: int) -> str:
     Args:
         post_id: 教程 ID，如 2373 (机械动力教程目录)
     """
+    if post_id <= 0:
+        return "❌ 无效的教程 ID"
+
     url = f"{BASE_URL}/post/{post_id}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取教程 {post_id} 失败，请检查 ID 是否正确"
+        return f"❌ 获取教程失败，ID {post_id} 可能不存在或网络异常"
 
-    result = [f"教程 ID: {post_id}"]
+    # 检查是否为 404 页面
+    title_tag = soup.select_one("title")
+    if title_tag and "404" in title_tag.get_text():
+        return f"❌ 教程 ID {post_id} 不存在，请检查 ID 是否正确"
+
+    result = [f"📖 教程 ID: {post_id}"]
 
     # 标题
     title = soup.select_one(".post-title h5, h1, .title")
@@ -381,10 +461,10 @@ async def mcmod_get_tutorial(post_id: int) -> str:
             tag.decompose()
         text = content.get_text("\n", strip=True)
         if len(text) > 2500:
-            text = text[:2500] + "\n\n[内容过长，已截断，请访问原页面查看完整内容]"
-        result.append(f"\n内容:\n{text}")
+            text = text[:2500] + "\n\n📄 [内容过长，已截断，请访问原页面查看完整内容]"
+        result.append(f"\n📝 内容:\n{text}")
 
-    result.append(f"\n页面链接: {url}")
+    result.append(f"\n🌐 页面链接: {url}")
     return "\n".join(result)
 
 
@@ -396,11 +476,14 @@ async def mcmod_find_mod(name: str) -> str:
     Args:
         name: 模组名称，如 "机械动力"、"Create"、"AE2"
     """
+    if not name or not name.strip():
+        return "❌ 请输入模组名称"
+
     # 使用全局搜索，结果更准确
     url = f"{SEARCH_URL}/s?key={name}"
     soup = await fetch_page(url, use_cache=False)
     if not soup:
-        return "搜索失败，请检查网络连接"
+        return "❌ 搜索失败，MC百科服务器可能暂时不可用"
 
     results = []
     seen = set()
@@ -427,9 +510,9 @@ async def mcmod_find_mod(name: str) -> str:
             break
 
     if not results:
-        return f"未找到名为 '{name}' 的模组"
+        return f"🔍 未找到名为 '{name}' 的模组，建议:\n- 检查拼写是否正确\n- 尝试使用英文名或缩写\n- 使用 mcmod_search 进行更广泛的搜索"
 
-    return f"搜索 '{name}' 找到的模组:\n\n" + "\n".join(results) + "\n\n使用 mcmod_get_mod(ID) 获取详情"
+    return f"🔍 搜索 '{name}' 找到的模组:\n\n" + "\n".join(results) + "\n\n💡 使用 mcmod_get_mod(ID) 获取详情"
 
 
 @mcp.tool()
@@ -440,12 +523,20 @@ async def mcmod_get_modpack(modpack_id: int) -> str:
     Args:
         modpack_id: 整合包 ID，如 549 (机械动力：锄与锤)
     """
+    if modpack_id <= 0:
+        return "❌ 无效的整合包 ID"
+
     url = f"{BASE_URL}/modpack/{modpack_id}.html"
     soup = await fetch_page(url)
     if not soup:
-        return f"获取整合包 {modpack_id} 失败，请检查 ID 是否正确"
+        return f"❌ 获取整合包失败，ID {modpack_id} 可能不存在或网络异常"
 
-    result = [f"整合包 ID: {modpack_id}"]
+    # 检查是否为 404 页面
+    title = soup.select_one("title")
+    if title and "404" in title.get_text():
+        return f"❌ 整合包 ID {modpack_id} 不存在，请检查 ID 是否正确"
+
+    result = [f"📦 整合包 ID: {modpack_id}"]
 
     # 名称
     name = soup.select_one("h3")
@@ -471,7 +562,7 @@ async def mcmod_get_modpack(modpack_id: int) -> str:
     intro = soup.select_one(".text-area.common-text")
     if intro:
         intro_text = intro.get_text(" ", strip=True)[:800]
-        result.append(f"\n简介:\n{intro_text}")
+        result.append(f"\n📝 简介:\n{intro_text}")
 
     # 包含的模组
     mod_links = soup.select("a[href*='/class/'][href$='.html']")
@@ -488,11 +579,11 @@ async def mcmod_get_modpack(modpack_id: int) -> str:
                 seen.add(mod_id)
                 mods.append(f"{mod_name} (ID: {mod_id})")
         if mods:
-            result.append(f"\n包含模组: {', '.join(mods[:10])}")
+            result.append(f"\n🧩 包含模组: {', '.join(mods[:10])}")
             if len(mods) > 10:
                 result.append(f"...等共 {len(mods)} 个模组")
 
-    result.append(f"\n页面链接: {url}")
+    result.append(f"\n🌐 页面链接: {url}")
     return "\n".join(result)
 
 
@@ -504,10 +595,13 @@ async def mcmod_find_modpack(name: str) -> str:
     Args:
         name: 整合包名称，如 "机械动力"、"科技"
     """
+    if not name or not name.strip():
+        return "❌ 请输入整合包名称"
+
     url = f"{SEARCH_URL}/s?key={name}&filter=2"
     soup = await fetch_page(url, use_cache=False)
     if not soup:
-        return "搜索失败，请检查网络连接"
+        return "❌ 搜索失败，MC百科服务器可能暂时不可用"
 
     results = []
     seen = set()
@@ -530,9 +624,122 @@ async def mcmod_find_modpack(name: str) -> str:
             break
 
     if not results:
-        return f"未找到名为 '{name}' 的整合包"
+        return f"🔍 未找到名为 '{name}' 的整合包，建议尝试其他关键词"
 
-    return f"搜索 '{name}' 找到的整合包:\n\n" + "\n".join(results) + "\n\n使用 mcmod_get_modpack(ID) 获取详情"
+    return f"🔍 搜索 '{name}' 找到的整合包:\n\n" + "\n".join(results) + "\n\n💡 使用 mcmod_get_modpack(ID) 获取详情"
+
+
+@mcp.tool()
+async def mcmod_hot_mods(category: str = "all", limit: int = 20) -> str:
+    """
+    获取热门/推荐模组列表
+
+    Args:
+        category: 分类 - all(全部/首页推荐), tech(科技), magic(魔法), adventure(冒险), farming(农业), decoration(装饰), misc(杂项)
+        limit: 返回数量，默认 20
+    """
+    # 分类映射 (MCMOD 分类 ID)
+    cat_map = {
+        "all": "",
+        "tech": "category/1-",
+        "magic": "category/2-",
+        "adventure": "category/3-",
+        "farming": "category/4-",
+        "decoration": "category/5-",
+        "misc": "category/6-",
+    }
+    cat_names = {
+        "all": "推荐",
+        "tech": "科技",
+        "magic": "魔法",
+        "adventure": "冒险",
+        "farming": "农业",
+        "decoration": "装饰",
+        "misc": "杂项",
+    }
+
+    if category not in cat_map:
+        return f"❌ 无效的分类，支持: {', '.join(f'{k}({v})' for k, v in cat_names.items())}"
+
+    cat_path = cat_map.get(category, "")
+
+    # all 使用首页获取推荐模组，其他使用分类页
+    if category == "all":
+        url = f"{BASE_URL}/"
+    else:
+        url = f"{BASE_URL}/class/{cat_path}1.html"
+
+    soup = await fetch_page(url)
+    if not soup:
+        return "❌ 获取热门模组失败，MC百科服务器可能暂时不可用"
+
+    mods = []
+    seen = set()
+
+    for link in soup.select("a[href*='/class/'][href$='.html']"):
+        href = link.get("href", "")
+        title = link.get_text(strip=True)
+
+        if "/category/" in href or not title or len(title) < 2:
+            continue
+        if title.startswith("www.") or "mcmod.cn" in title:
+            continue
+        # 跳过括号开头的英文名链接
+        if title.startswith("("):
+            continue
+
+        mod_id = extract_id_from_url(href, r"/class/(\d+)")
+        if mod_id and mod_id not in seen:
+            seen.add(mod_id)
+            mods.append(f"- {title} (ID: {mod_id})")
+
+        if len(mods) >= limit:
+            break
+
+    if not mods:
+        return "📭 暂无热门模组数据"
+
+    cat_name = cat_names.get(category, "全部")
+    return f"🔥 热门{cat_name}模组 ({len(mods)}个):\n\n" + "\n".join(mods) + "\n\n💡 使用 mcmod_get_mod(ID) 获取详情"
+
+
+@mcp.tool()
+async def mcmod_random_mod() -> str:
+    """
+    获取一个随机模组推荐（从首页推荐模组中随机选择）
+    """
+    import random
+
+    url = f"{BASE_URL}/"
+    soup = await fetch_page(url, use_cache=False)
+    if not soup:
+        return "❌ 获取随机模组失败，MC百科服务器可能暂时不可用"
+
+    mods = []
+    seen = set()
+    for link in soup.select("a[href*='/class/'][href$='.html']"):
+        href = link.get("href", "")
+        title = link.get_text(strip=True)
+
+        if "/category/" in href or not title or len(title) < 2:
+            continue
+        if title.startswith("www.") or "mcmod.cn" in title:
+            continue
+        if title.startswith("("):
+            continue
+
+        mod_id = extract_id_from_url(href, r"/class/(\d+)")
+        if mod_id and mod_id not in seen:
+            seen.add(mod_id)
+            mods.append((title, mod_id))
+
+    if not mods:
+        return "📭 暂无模组数据"
+
+    title, mod_id = random.choice(mods[:30])
+    # 获取详情
+    detail = await mcmod_get_mod(int(mod_id))
+    return f"🎲 随机推荐模组:\n\n{detail}"
 
 
 if __name__ == "__main__":
