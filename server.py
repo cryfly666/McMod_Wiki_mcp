@@ -5,7 +5,9 @@ MCMOD 百科 MCP Server
 
 import re
 import asyncio
+import random
 from typing import Optional
+from urllib.parse import quote
 from mcp.server.fastmcp import FastMCP
 import httpx
 from bs4 import BeautifulSoup
@@ -28,6 +30,7 @@ HEADERS = {
 # 简单缓存 (URL -> (timestamp, content))
 _cache: dict[str, tuple[float, str]] = {}
 CACHE_TTL = 300  # 5 分钟
+CACHE_MAX_SIZE = 100  # 最大缓存条目数
 
 
 async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Optional[BeautifulSoup]:
@@ -62,10 +65,18 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
                         continue
                     # 最后一次尝试，接受较短的内容
                     if len(html) > 1000:
+                        if len(_cache) >= CACHE_MAX_SIZE:
+                            oldest_key = min(_cache, key=lambda k: _cache[k][0])
+                            del _cache[oldest_key]
                         _cache[url] = (time.time(), html)
                         return BeautifulSoup(html, "html.parser")
                     return None
 
+                # 缓存大小限制
+                if len(_cache) >= CACHE_MAX_SIZE:
+                    # 删除最旧的条目
+                    oldest_key = min(_cache, key=lambda k: _cache[k][0])
+                    del _cache[oldest_key]
                 _cache[url] = (time.time(), html)
                 return BeautifulSoup(html, "html.parser")
         except httpx.HTTPStatusError:
@@ -101,7 +112,7 @@ async def mcmod_search(keyword: str, search_type: str = "all", limit: int = 10) 
     # filter: 1=模组, 2=整合包, 3=物品, 4=教程
     type_map = {"all": "", "mod": "&filter=1", "modpack": "&filter=2", "item": "&filter=3", "post": "&filter=4"}
     filter_param = type_map.get(search_type, "")
-    url = f"{SEARCH_URL}/s?key={keyword}{filter_param}"
+    url = f"{SEARCH_URL}/s?key={quote(keyword)}{filter_param}"
 
     soup = await fetch_page(url, use_cache=False)
     if not soup:
@@ -480,7 +491,7 @@ async def mcmod_find_mod(name: str) -> str:
         return "❌ 请输入模组名称"
 
     # 使用全局搜索，结果更准确
-    url = f"{SEARCH_URL}/s?key={name}"
+    url = f"{SEARCH_URL}/s?key={quote(name)}"
     soup = await fetch_page(url, use_cache=False)
     if not soup:
         return "❌ 搜索失败，MC百科服务器可能暂时不可用"
@@ -598,7 +609,7 @@ async def mcmod_find_modpack(name: str) -> str:
     if not name or not name.strip():
         return "❌ 请输入整合包名称"
 
-    url = f"{SEARCH_URL}/s?key={name}&filter=2"
+    url = f"{SEARCH_URL}/s?key={quote(name)}&filter=2"
     soup = await fetch_page(url, use_cache=False)
     if not soup:
         return "❌ 搜索失败，MC百科服务器可能暂时不可用"
@@ -704,11 +715,13 @@ async def mcmod_hot_mods(category: str = "all", limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def mcmod_random_mod() -> str:
+async def mcmod_random_mod(dummy: str = "") -> str:
     """
     获取一个随机模组推荐（从首页推荐模组中随机选择）
+
+    Args:
+        dummy: 占位参数，无需传入
     """
-    import random
 
     url = f"{BASE_URL}/"
     soup = await fetch_page(url, use_cache=False)
