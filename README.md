@@ -58,7 +58,8 @@ uv run server.py
 
 ## MCP 配置
 
-添加到 `.kiro/settings/mcp.json`：
+修改为你的mcp实际路径："/path/to/evil/mcp/mcmod-mcp"
+添加到 `mcp.json`或任何支持mcp的地方：
 
 ```json
 {
