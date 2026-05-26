@@ -33,8 +33,12 @@ CACHE_TTL = 300  # 5 分钟
 CACHE_MAX_SIZE = 100  # 最大缓存条目数
 
 
+# search.mcmod.cn 的反爬虫 cookie（首次请求自动获取）
+_search_cookies: dict[str, str] = {}
+
+
 async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Optional[BeautifulSoup]:
-    """获取并解析页面，支持缓存和重试，验证内容完整性"""
+    """获取并解析页面，支持缓存、重试，以及 search.mcmod.cn 的反爬虫 cookie 处理"""
     # 检查缓存
     if use_cache and url in _cache:
         ts, html = _cache[url]
@@ -43,11 +47,15 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
 
     # 判断是否为搜索页面
     is_search = "search.mcmod.cn" in url
-    min_length = 30000 if is_search else 5000  # 搜索页面应该更大
 
     for attempt in range(retries + 1):
         try:
             async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+                # 搜索页面：将已缓存的反爬虫 cookie 注入 client
+                if is_search and _search_cookies:
+                    for k, v in _search_cookies.items():
+                        client.cookies.set(k, v, domain="search.mcmod.cn")
+
                 resp = await client.get(url)
 
                 # 检查是否被重定向到404页面
@@ -58,29 +66,38 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
                 resp.raise_for_status()
                 html = resp.text
 
-                # 验证内容完整性
-                if len(html) < min_length:
+                # 处理 search.mcmod.cn 的反爬虫机制：
+                # 首次请求返回 ~147 字节的 JS 片段设置 yxd_token cookie
+                if is_search and len(html) < 500 and "document.cookie" in html:
+                    match = re.search(r"document\.cookie\s*=\s*['\"]([^'\"]+)['\"]", html)
+                    if match:
+                        cookie_str = match.group(1)
+                        if "=" in cookie_str:
+                            k, v = cookie_str.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            # 注入到 client cookie jar 并缓存
+                            client.cookies.set(k, v, domain="search.mcmod.cn")
+                            _search_cookies[k] = v
+                            # 带 cookie 重试
+                            resp = await client.get(url)
+                            resp.raise_for_status()
+                            html = resp.text
+
+                # 仍然是反爬虫响应 → 清空 cookie 重试
+                if is_search and len(html) < 500 and "document.cookie" in html:
                     if attempt < retries:
+                        _search_cookies.clear()
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
-                    # 最后一次尝试，接受较短的内容
-                    if len(html) > 1000:
-                        if len(_cache) >= CACHE_MAX_SIZE:
-                            oldest_key = min(_cache, key=lambda k: _cache[k][0])
-                            del _cache[oldest_key]
-                        _cache[url] = (time.time(), html)
-                        return BeautifulSoup(html, "html.parser")
                     return None
 
-                # 缓存大小限制
+                # 缓存
                 if len(_cache) >= CACHE_MAX_SIZE:
-                    # 删除最旧的条目
                     oldest_key = min(_cache, key=lambda k: _cache[k][0])
                     del _cache[oldest_key]
                 _cache[url] = (time.time(), html)
                 return BeautifulSoup(html, "html.parser")
         except httpx.HTTPStatusError:
-            # 4xx/5xx 错误直接返回 None
             return None
         except Exception:
             if attempt < retries:
