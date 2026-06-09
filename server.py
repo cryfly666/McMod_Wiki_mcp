@@ -27,36 +27,91 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+# search.mcmod.cn 专用请求头（需要 Referer 否则 403）
+SEARCH_HEADERS = {
+    **HEADERS,
+    "Referer": "https://www.mcmod.cn/",
+    "Origin": "https://www.mcmod.cn",
+}
+
 # 简单缓存 (URL -> (timestamp, content))
 _cache: dict[str, tuple[float, str]] = {}
 CACHE_TTL = 300  # 5 分钟
 CACHE_MAX_SIZE = 100  # 最大缓存条目数
 
+# 请求频率限制
+_last_request_time: float = 0.0
+MIN_REQUEST_INTERVAL = 2.0  # search.mcmod.cn 两次请求最小间隔（秒）
+_search_fail_count = 0
+_search_cooldown_until: float = 0.0  # 连续失败后的冷却期
 
 # search.mcmod.cn 的反爬虫 cookie（首次请求自动获取）
 _search_cookies: dict[str, str] = {}
 
+def _get_headers(url: str) -> dict:
+    """根据 URL 选择请求头（搜索页需要 Referer 防 403）"""
+    return SEARCH_HEADERS if "search.mcmod.cn" in url else HEADERS
+
+
+async def _rate_limit(is_search: bool):
+    """请求频率限制，搜索页面间隔至少 2s，其他页面至少 0.5s"""
+    global _last_request_time, _search_cooldown_until
+
+    min_interval = MIN_REQUEST_INTERVAL if is_search else 0.5
+
+    # 搜索页连续失败后的冷却期
+    if is_search and _search_cooldown_until > time.time():
+        wait = _search_cooldown_until - time.time()
+        await asyncio.sleep(wait)
+
+    # 确保最小请求间隔
+    elapsed = time.time() - _last_request_time
+    if elapsed < min_interval:
+        await asyncio.sleep(min_interval - elapsed + random.uniform(0, 0.5))
+
+    _last_request_time = time.time()
+
 
 async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Optional[BeautifulSoup]:
-    """获取并解析页面，支持缓存、重试，以及 search.mcmod.cn 的反爬虫 cookie 处理"""
+    """获取并解析页面，支持缓存、重试、频率限制，以及 search.mcmod.cn 的反爬虫 cookie 处理"""
+    global _search_fail_count, _search_cooldown_until
+
     # 检查缓存
     if use_cache and url in _cache:
         ts, html = _cache[url]
         if time.time() - ts < CACHE_TTL:
             return BeautifulSoup(html, "html.parser")
 
-    # 判断是否为搜索页面
     is_search = "search.mcmod.cn" in url
+    await _rate_limit(is_search)
+
+    req_headers = _get_headers(url)
 
     for attempt in range(retries + 1):
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+            async with httpx.AsyncClient(headers=req_headers, follow_redirects=True, timeout=20) as client:
                 # 搜索页面：将已缓存的反爬虫 cookie 注入 client
                 if is_search and _search_cookies:
                     for k, v in _search_cookies.items():
                         client.cookies.set(k, v, domain="search.mcmod.cn")
 
                 resp = await client.get(url)
+
+                # 先检查 HTTP 状态码
+                if resp.status_code == 429:
+                    wait = 5.0 * (attempt + 1) + random.uniform(1, 3)
+                    if attempt < retries:
+                        await asyncio.sleep(wait)
+                        continue
+                    return None
+
+                if resp.status_code == 403:
+                    _search_cookies.clear()
+                    wait = 3.0 * (attempt + 1) + random.uniform(1, 2)
+                    if attempt < retries:
+                        await asyncio.sleep(wait)
+                        continue
+                    return None
 
                 # 检查是否被重定向到404页面
                 final_url = str(resp.url)
@@ -75,19 +130,29 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
                         if "=" in cookie_str:
                             k, v = cookie_str.split("=", 1)
                             k, v = k.strip(), v.strip()
-                            # 注入到 client cookie jar 并缓存
                             client.cookies.set(k, v, domain="search.mcmod.cn")
                             _search_cookies[k] = v
-                            # 带 cookie 重试
+                            await asyncio.sleep(0.5)
                             resp = await client.get(url)
                             resp.raise_for_status()
                             html = resp.text
+
+                # 保存 set-cookie
+                for set_cookie in resp.headers.get_list("set-cookie", []):
+                    for part in set_cookie.split(";"):
+                        part = part.strip()
+                        if "=" in part and not part.lower().startswith(("path=", "domain=", "expires=", "max-age=", "samesite=", "secure", "httponly")):
+                            k, v = part.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            if k and v:
+                                client.cookies.set(k, v, domain="search.mcmod.cn")
+                                _search_cookies[k] = v
 
                 # 仍然是反爬虫响应 → 清空 cookie 重试
                 if is_search and len(html) < 500 and "document.cookie" in html:
                     if attempt < retries:
                         _search_cookies.clear()
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                        await asyncio.sleep(1.0 * (attempt + 1))
                         continue
                     return None
 
@@ -96,14 +161,27 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
                     oldest_key = min(_cache, key=lambda k: _cache[k][0])
                     del _cache[oldest_key]
                 _cache[url] = (time.time(), html)
+
+                # 搜索成功，重置失败计数
+                if is_search:
+                    _search_fail_count = 0
+                    _search_cooldown_until = 0.0
+
                 return BeautifulSoup(html, "html.parser")
         except httpx.HTTPStatusError:
             return None
         except Exception:
             if attempt < retries:
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(1.0 * (attempt + 1) + random.uniform(0, 1))
                 continue
             return None
+
+    # 搜索连续失败 → 进入冷却期
+    if is_search:
+        _search_fail_count += 1
+        if _search_fail_count >= 3:
+            _search_cooldown_until = time.time() + 30  # 冷却 30 秒
+
     return None
 
 
