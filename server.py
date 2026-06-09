@@ -53,16 +53,15 @@ def _get_headers(url: str) -> dict:
     return SEARCH_HEADERS if "search.mcmod.cn" in url else HEADERS
 
 
-async def _rate_limit(is_search: bool):
-    """请求频率限制，搜索页面间隔至少 2s，其他页面至少 0.5s"""
-    global _last_request_time, _search_cooldown_until
+async def _rate_limit(is_search: bool) -> bool:
+    """请求频率限制，返回 True 表示在冷却期（应立即返回错误），否则阻塞等待并返回 False"""
+    global _last_request_time
+
+    # 搜索页连续失败后的冷却期 — 直接拒绝，不阻塞
+    if is_search and _search_cooldown_until > time.time():
+        return True
 
     min_interval = MIN_REQUEST_INTERVAL if is_search else 0.5
-
-    # 搜索页连续失败后的冷却期
-    if is_search and _search_cooldown_until > time.time():
-        wait = _search_cooldown_until - time.time()
-        await asyncio.sleep(wait)
 
     # 确保最小请求间隔
     elapsed = time.time() - _last_request_time
@@ -70,6 +69,7 @@ async def _rate_limit(is_search: bool):
         await asyncio.sleep(min_interval - elapsed + random.uniform(0, 0.5))
 
     _last_request_time = time.time()
+    return False
 
 
 async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Optional[BeautifulSoup]:
@@ -83,7 +83,8 @@ async def fetch_page(url: str, use_cache: bool = True, retries: int = 3) -> Opti
             return BeautifulSoup(html, "html.parser")
 
     is_search = "search.mcmod.cn" in url
-    await _rate_limit(is_search)
+    if await _rate_limit(is_search):
+        return None  # 冷却期，立即返回让 AI 收到明确错误提示
 
     req_headers = _get_headers(url)
 
